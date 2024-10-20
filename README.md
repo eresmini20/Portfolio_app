@@ -1,4 +1,4 @@
-To run the app, open the terminal and write the following command : 
+To run the app, open the terminal and write the following command by using the folder path of the project: 
 
 streamlit run Portfolio_app.py
 
