@@ -6,7 +6,9 @@ streamlit run Portfolio_app.py
 
 Version 0.1 :
 
-- Portfolio optimization : IMPLEMENTED
+- Portfolio optimization
+        - Max sharpe ratio optimization : IMPLEMENTED
+        - Min variance optimization : NOT IMPLEMENTED
 - Efficient frontier graph : IMPLEMENTED
 - Backtesting on out-of-sample data : NOT IMPLEMENTED
 - Risk-Aversion Quiz : IMPLEMENTED BUT ADAPT QUESTIONS
