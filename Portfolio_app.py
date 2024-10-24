@@ -10,8 +10,15 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import minimize
+from scipy.stats import qmc
+import cvxpy as cp
 import scipy.optimize as sco
+from pypfopt import EfficientFrontier, expected_returns, risk_models, CLA
 import time
+
+# -------------------------------
+# 1. Imports and Data Loading
+# -------------------------------
 
 # # Load the returns data
 # df = pd.read_excel(
@@ -127,6 +134,11 @@ print(data.head())
 assets = data.columns.tolist()
 
 
+# -------------------------------
+# 2. Risk Aversion Quiz
+# -------------------------------
+
+
 # Risk aversion quiz using a form
 def risk_aversion_quiz():
     st.header("Risk Aversion Quiz")
@@ -228,6 +240,11 @@ if "risk_aversion" not in st.session_state:
 else:
     risk_aversion = st.session_state["risk_aversion"]
 
+
+# -------------------------------
+# 3. Constraints Selection and Parameters
+# -------------------------------
+
 # Initialize session state variables
 if "optimization_run" not in st.session_state:
     st.session_state["optimization_run"] = False
@@ -251,6 +268,17 @@ carbon_footprint = st.checkbox("Carbon footprint")
 min_weight_constraint = st.checkbox("Minimum weight constraint")
 max_weight_constraint = st.checkbox("Maximum weight constraint")
 leverage_limit = st.checkbox("Leverage limit")
+
+# Choose objective function
+st.header("Choose Optimization Objective")
+objectives = [
+    "Maximum Sharpe Ratio Portfolio",
+    "Minimum Global Variance Portfolio",
+    "Maximum Diversification Portflio",
+    "Equally Weighted Risk Contribution Portfolio",
+    "Inverse Volatility Portfolio",
+]
+selected_objective = st.multiselect("Select an objective function", objectives)
 
 # Risk-Free Asset Inclusion
 st.header("Risk-Free Asset Inclusion")
@@ -285,7 +313,9 @@ else:
 
 if min_weight_constraint:
     min_weight_value = (
-        st.number_input("Minimum weight (%)", min_value=0.0, max_value=100.0, value=0.0)
+        st.number_input(
+            "Minimum weight (%)", min_value=-100.0, max_value=100.0, value=-100.0
+        )
         / 100
     )
 else:
@@ -345,6 +375,10 @@ if previous_params is not None and current_params != previous_params:
 # Update previous parameters
 st.session_state["previous_params"] = current_params
 
+# -------------------------------
+# 4. Data Filtering Based on Sectors and Countries
+# -------------------------------
+
 # Output the total number of stocks before filtering
 st.write(f"Total number of stocks before filtering: {data.shape[1]}")
 
@@ -375,258 +409,286 @@ data = filter_stocks(data, sectors=selected_sectors, countries=selected_countrie
 # Assets list after filtering
 assets = data.columns.tolist()
 
+# -------------------------------
+# 5. Optimization Function
+# -------------------------------
 
-# Efficient Frontier Calculation
-def calculate_efficient_frontier(
-    mean_returns,
-    cov_matrix,
-    risk_free_rate,
-    include_risk_free_asset,
-    long_only,
-    leverage_limit_value,
-    min_weight_value,
-    max_weight_value,
-):
-    target_returns = np.linspace(mean_returns.min() * 12, mean_returns.max() * 12, 20)
-    frontier_volatility = []
-    frontier_returns = []
-    frontier_weights = []
 
-    num_assets = len(mean_returns)
+def adjust_covariance_matrix(cov_matrix, delta=1e-5):
+    # Compute eigenvalues and eigenvectors
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
 
-    for target_return in stqdm(target_returns, desc="Computing the frontier... "):
-        # Constraints for the optimization
-        constraints = [
-            {"type": "eq", "fun": lambda x: np.sum(x) - 1},  # Sum of weights equals 1
-            {
-                "type": "eq",
-                "fun": lambda x: np.sum(x * mean_returns * 12)
-                - target_return,  # Target return constraint
-            },
-        ]
+    if np.all(eigenvalues <= 0):
 
-        # Leverage limit constraint
-        if leverage_limit:
-            constraints = [
-                {
-                    "type": "ineq",
-                    "fun": lambda x: leverage_limit_value - np.sum(x),
-                },
-                {
-                    "type": "eq",
-                    "fun": lambda x: np.sum(x * mean_returns * 12)
-                    - target_return,  # Target return constraint
-                },
-            ]
+        # Adjust negative eigenvalues
+        adjusted_eigenvalues = np.where(eigenvalues > delta, eigenvalues, delta)
 
-        # Bounds
-        if long_only:
-            # Apply minimum and maximum weight constraints
-            bounds = tuple(
-                (max(min_weight_value, 0.0), min(max_weight_value, 1.0))
-                for _ in range(num_assets)
-            )
-        else:
-            # Allow short selling within the leverage limit
-            bounds = tuple(
-                (-leverage_limit_value, leverage_limit_value) for _ in range(num_assets)
-            )
-
-        # Optimization
-        result = minimize(
-            lambda x: np.sqrt(
-                np.dot(x.T, np.dot(cov_matrix * 12, x))
-            ),  # Minimize volatility
-            num_assets * [1.0 / num_assets],  # Initial guess
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
+        # Reconstruct the covariance matrix
+        cov_matrix_adjusted = (
+            eigenvectors @ np.diag(adjusted_eigenvalues) @ eigenvectors.T
         )
 
-        if result.success:
-            frontier_volatility.append(result.fun)
-            frontier_returns.append(target_return)
-            frontier_weights.append(result.x)
+        # Ensure the covariance matrix is symmetric
+        cov_matrix_adjusted = (cov_matrix_adjusted + cov_matrix_adjusted.T) / 2
+
+        # Inform the user about the adjustment
+        st.info(
+            "Adjusted covariance matrix to be positive definite by correcting negative eigenvalues."
+        )
+
+        return cov_matrix_adjusted
+
+    else:
+        # Inform the user
+        st.info("Covariance matrix is PD.")
+
+        return cov_matrix
+
+
+def optimize_portfolio_PyPortfolioOpt(
+    data,
+    long_only,
+    min_weight,
+    max_weight,
+    leverage_limit_value,
+    risk_free_rate,
+    include_risk_free_asset,
+    risk_aversion,
+):
+    # mean_returns = expected_returns.mean_historical_return(
+    #     data, frequency=12
+    # )  # Annualized returns
+
+    # Calculate expected returns and covariance matrix
+    returns = data.pct_change().dropna()
+
+    # Remove infinite values and assets with zero variance
+    returns.replace([np.inf, -np.inf], np.nan, inplace=True)
+    returns.dropna(axis=1, how="any", inplace=True)
+    returns = returns.loc[:, returns.std() > 0]
+
+    mean_returns = returns.mean() * 12
+
+    cov_matrix = returns.cov() * 12
+
+    if len(data) / len(cov_matrix) < 2:
+
+        st.info(f"Len cov matrix : {len(cov_matrix)}")
+        st.info(f"Number observations : {len(data)}")
+
+        st.info(
+            f"Ratio of observations / nb. of assets is below 2, current ratio: {len(data) / len(cov_matrix)}. We use shrinkage. "
+        )
+
+        cov_matrix = risk_models.CovarianceShrinkage(data, frequency=12).ledoit_wolf()
+
+        st.info("Covariance matrix shrinked using Ledoit_Wolf. ")
+
+        # Use Ledoit-Wolf shrinkage to ensure the covariance matrix is positive semidefinite
+        cov_matrix = risk_models.fix_nonpositive_semidefinite(
+            cov_matrix
+        )  # Annualized covariance
+
+    # Adjust covariance matrix to be positive definite
+    cov_matrix_adjusted = adjust_covariance_matrix(cov_matrix.values)
+    cov_matrix_adjusted = pd.DataFrame(
+        cov_matrix_adjusted, index=cov_matrix.index, columns=cov_matrix.columns
+    )
+
+    st.write(f"Installed solvers : {cp.installed_solvers()}")
+
+    # # Add small value to diagonal to ensure positive definiteness
+    # epsilon = 1e-1
+    # cov_matrix_np = cov_matrix.values + epsilon * np.eye(len(cov_matrix))
+    # cov_matrix = pd.DataFrame(
+    #     cov_matrix_np, index=returns.columns, columns=returns.columns
+    # )
+
+    if leverage_limit:
+        # Set weight bounds
+        if long_only:
+            weight_bounds = (
+                max(min_weight, 0.0),
+                min(max_weight, leverage_limit_value),
+            )
         else:
-            # Handle optimization failure
-            st.warning(f"Optimization failed for target return {target_return:.2%}")
+            weight_bounds = (
+                max(min_weight, -leverage_limit_value),
+                min(max_weight, leverage_limit_value),
+            )
+    else:
+        # Set weight bounds
+        if long_only:
+            weight_bounds = (max(min_weight, 0.0), min(max_weight, 1.0))
+        else:
+            weight_bounds = (
+                max(min_weight, -1),
+                min(max_weight, 1),
+            )
+
+    # Prepare result similar to scipy.optimize result
+    class Result:
+        pass
+
+    result = Result()
+
+    solvers_installed = ["OSQP", "ECOS", "ECOS_BB", "SCS", "CLARABEL", "SCIPY"]
+
+    for solver in solvers_installed:
+        # Objective functions
+        try:
+            st.info(f"Trying solver: {solver}")
+
+            # Initialize Efficient Frontier
+            ef = EfficientFrontier(
+                mean_returns,
+                cov_matrix_adjusted,
+                weight_bounds=weight_bounds,
+                solver=solver,
+            )
+
+            # Add leverage limit constraint
+            if leverage_limit:
+                ef.add_constraint(lambda w: cp.sum(w) <= leverage_limit_value)
+                ef.add_constraint(lambda w: cp.sum(w) >= 1)
+            else:
+                ef.add_constraint(lambda w: cp.sum(w) == 1)
+
+            if include_risk_free_asset:
+                # Tangency Portfolio: Maximize Sharpe Ratio
+                ef.max_sharpe(risk_free_rate=risk_free_rate)
+            else:
+                # Maximize Utility Function
+                ef.max_quadratic_utility(risk_aversion=risk_aversion)
+
+            # Extract weights
+            cleaned_weights = ef.clean_weights()
+            weights = pd.Series(cleaned_weights).reindex(assets)
+
+            result.x = weights.values
+            result.success = True
+            result.status = "Optimization Succeeded"
+            result.fun = ef.portfolio_performance(verbose=False)[
+                1
+            ]  # Portfolio volatility
+
+            # Return result, mean returns, and covariance matrix
+            return result, mean_returns, cov_matrix_adjusted
+
+        except Exception as e:
+            st.error(f"Solver {solver} failed: {e}")
+            # Move on to the next solver if the current one fails
+
+    # If all solvers fail
+    result.x = None
+    result.success = False
+    result.status = "All solvers failed."
+    result.fun = None
+
+    # Return failure result after all solvers fail
+    return result, mean_returns, cov_matrix_adjusted
+
+
+def optimize_portfolio_qp(
+    data,
+    long_only,
+    min_weight,
+    max_weight,
+    leverage_limit_value,
+    risk_free_rate,
+    include_risk_free_asset,
+    risk_aversion,
+):
+
+    # Calculate returns, mean returns, and covariance matrix
+    returns = data.pct_change().dropna()
+    mean_returns = returns.mean() * 12  # Annualized mean returns
+    cov_matrix = returns.cov() * 12  # Annualized covariance matrix
+    num_assets = len(mean_returns)
+    assets = mean_returns.index.tolist()
+
+    # # Regularize the covariance matrix to make it positive semidefinite
+    # cov_matrix_np = cov_matrix.values
+    # epsilon = 1e-8  # Small positive value
+    # cov_matrix_np += epsilon * np.eye(num_assets)
+    # cov_matrix = pd.DataFrame(
+    #     cov_matrix_np, index=cov_matrix.index, columns=cov_matrix.columns
+    # )
+
+    # Define variables
+    w = cp.Variable(num_assets)
+
+    # Objective functions
+    if include_risk_free_asset:
+        # Tangency Portfolio: Maximize Sharpe Ratio
+        # Since maximizing Sharpe Ratio directly is non-convex, we can reformulate
+        # the problem to minimize portfolio variance for a unit of excess return
+        # (mu - rf)^T w = 1
+        # Minimize w^T Σ w
+
+        # Define the objective function: Minimize portfolio variance
+        portfolio_variance = cp.quad_form(w, cov_matrix)
+        objective = cp.Minimize(portfolio_variance)
+
+        # Constraints
+        constraints = []
+
+        # Excess return over risk-free rate equals 1
+        constraints.append((mean_returns.values - risk_free_rate) @ w == 1)
+
+    else:
+        # Maximize Utility Function: Maximize expected return minus risk aversion times variance
+        portfolio_return = mean_returns.values @ w
+        portfolio_variance = cp.quad_form(w, cov_matrix)
+        utility = portfolio_return - 0.5 * risk_aversion * portfolio_variance
+        objective = cp.Maximize(utility)
+
+        # Constraints
+        constraints = []
+
+    # Sum of weights equals 1
+    constraints.append(cp.sum(w) >= 1)
+
+    # Leverage limit constraint
+    constraints.append(cp.sum(w) <= leverage_limit_value)
+
+    # Weight bounds
+    if long_only:
+        constraints.append(w >= max(min_weight, 0.0))
+        constraints.append(w <= min(max_weight, leverage_limit_value))
+    else:
+        constraints.append(w >= -1)
+        constraints.append(w <= 1)
+
+    # Solve the optimization problem
+    prob = cp.Problem(objective, constraints)
+    try:
+        prob.solve(solver=cp.SCS, verbose=False)
+    except Exception as e:
+        st.error(f"Optimization failed: {e}")
+        return None, mean_returns, cov_matrix
+
+    # Check if the optimization was successful
+    if prob.status not in ["infeasible", "unbounded"]:
+
+        # Extract weights
+        weights = w.value
+        weights = pd.Series(weights, index=assets)
+
+        # Prepare result similar to scipy.optimize result
+        class Result:
             pass
 
-    return frontier_volatility, frontier_returns, frontier_weights
+        result = Result()
+        result.x = weights.values
+        result.success = True
+        result.status = prob.status
+        result.fun = prob.value
 
-
-# Efficient Frontier Plotting Function
-def plot_efficient_frontier(
-    mean_returns,
-    cov_matrix,
-    risk_free_rate,
-    include_risk_free_asset,
-    weights_optimal,
-    long_only,
-    leverage_limit_value,
-    min_weight_value,
-    max_weight_value,
-):
-    # Calculate the efficient frontier with updated constraints
-    frontier_volatility, frontier_returns, frontier_weights = (
-        calculate_efficient_frontier(
-            mean_returns,
-            cov_matrix,
-            risk_free_rate,
-            include_risk_free_asset,
-            long_only,
-            leverage_limit_value,
-            min_weight_value,
-            max_weight_value,
-        )
-    )
-
-    # Generate random portfolios
-    st.info("Generating random portfolios to display inefficient portfolios...")
-    num_portfolios = 1000
-    results = np.zeros((3, num_portfolios))
-
-    np.random.seed(42)  # For reproducibility
-
-    for i in stqdm(range(num_portfolios), desc="Generating random weights... "):
-        # Generate random weights
-        weights = np.random.dirichlet(np.ones(len(mean_returns)))
-        weights /= np.sum(weights)
-
-        # Apply weight bounds
-        if long_only:
-            weights = np.clip(
-                weights, max(min_weight_value, 0.0), min(max_weight_value, 1.0)
-            )
-        else:
-            weights = np.clip(weights, -leverage_limit_value, leverage_limit_value)
-
-        # Check if weights satisfy leverage limit
-        if leverage_limit:
-            if np.sum(np.abs(weights)) > leverage_limit_value:
-                continue  # Skip weights that exceed leverage limit
-
-        # Calculate portfolio performance
-        portfolio_return = np.sum(mean_returns * weights) * 12  # Annualized return
-        portfolio_volatility = np.sqrt(
-            np.dot(weights.T, np.dot(cov_matrix * 12, weights))
-        )  # Annualized volatility
-
-        # Sharpe Ratio
-        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
-
-        results[0, i] = portfolio_volatility
-        results[1, i] = portfolio_return
-        results[2, i] = sharpe_ratio
-
-    # Remove zeros (portfolios that were skipped)
-    mask = results[0, :] != 0
-    results = results[:, mask]
-
-    # Plotting
-    plt.figure(figsize=(10, 7))
-    plt.scatter(
-        results[0],
-        results[1],
-        c=results[2],
-        cmap="viridis",
-        s=2,
-        alpha=0.4,
-        label="Random Portfolios",
-    )
-    plt.colorbar(label="Sharpe Ratio")
-    plt.plot(
-        frontier_volatility,
-        frontier_returns,
-        "r--",
-        linewidth=3,
-        label="Efficient Frontier",
-    )
-
-    if include_risk_free_asset:
-        # # Calculate the tangency portfolio
-        # def neg_sharpe_ratio(weights):
-        #     portfolio_return = np.sum(mean_returns * weights) * 12
-        #     portfolio_volatility = np.sqrt(
-        #         np.dot(weights.T, np.dot(cov_matrix * 12, weights))
-        #     )
-        #     sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
-        #     return -sharpe_ratio
-
-        # # Constraints for tangency portfolio
-        # constraints = [{"type": "eq", "fun": lambda x: np.sum(x) - 1}]
-        # if leverage_limit:
-        #     constraints = [
-        #         {
-        #             "type": "ineq",
-        #             "fun": lambda x: leverage_limit_value - np.sum(np.abs(x)),
-        #         }
-        #     ]
-
-        # # Bounds
-        # if long_only:
-        #     bounds = tuple(
-        #         (max(min_weight_value, 0.0), min(max_weight_value, 1.0))
-        #         for _ in range(num_assets)
-        #     )
-        # else:
-        #     bounds = tuple(
-        #         (-leverage_limit_value, leverage_limit_value) for _ in range(num_assets)
-        #     )
-
-        # result = minimize(
-        #     neg_sharpe_ratio,
-        #     num_assets * [1.0 / num_assets],
-        #     method="SLSQP",
-        #     bounds=bounds,
-        #     constraints=constraints,
-        # )
-
-        # if result.success:
-        tangency_weights = weights_optimal
-        tangency_return = np.sum(mean_returns * tangency_weights) * 12
-        tangency_volatility = np.sqrt(
-            np.dot(tangency_weights.T, np.dot(cov_matrix * 12, tangency_weights))
-        )
-
-        # Plot the Capital Market Line
-        cml_x = [0, tangency_volatility]
-        cml_y = [risk_free_rate, tangency_return]
-        plt.plot(
-            cml_x, cml_y, color="green", linestyle="--", label="Capital Market Line"
-        )
-
-        # Highlight the tangency portfolio
-        plt.scatter(
-            tangency_volatility,
-            tangency_return,
-            marker="*",
-            color="red",
-            s=500,
-            label="Tangency Portfolio",
-        )
-        # else:
-        #     st.warning("Failed to compute the tangency portfolio.")
+        return result, mean_returns, cov_matrix
     else:
-        # Highlight the optimal portfolio
-        portfolio_return = np.sum(mean_returns * weights_optimal) * 12
-        portfolio_volatility = np.sqrt(
-            np.dot(weights_optimal.T, np.dot(cov_matrix * 12, weights_optimal))
-        )
-        plt.scatter(
-            portfolio_volatility,
-            portfolio_return,
-            marker="*",
-            color="red",
-            s=500,
-            label="Optimal Portfolio",
-        )
-
-    plt.title("Efficient Frontier with Random Portfolios")
-    plt.xlabel("Annualized Volatility")
-    plt.ylabel("Annualized Expected Returns")
-    plt.legend()
-    st.pyplot(plt)
+        st.error(f"Optimization failed. Problem status: {prob.status}")
+        return None, mean_returns, cov_matrix
 
 
 # Optimization function
@@ -641,8 +703,8 @@ def optimize_portfolio(
     risk_aversion,
 ):
     returns = data.pct_change().dropna()
-    mean_returns = returns.mean()
-    cov_matrix = returns.cov()
+    mean_returns = returns.mean() * 12
+    cov_matrix = returns.cov() * 12
     num_assets = len(mean_returns)
     initial_weights = num_assets * [
         1.0 / num_assets,
@@ -652,7 +714,8 @@ def optimize_portfolio(
     constraints = [{"type": "eq", "fun": lambda x: np.sum(x) - 1}]
     if leverage_limit:
         constraints = [
-            {"type": "ineq", "fun": lambda x: leverage_limit_value - np.sum(x)}
+            {"type": "ineq", "fun": lambda x: leverage_limit_value - np.sum(x)},
+            {"type": "ineq", "fun": lambda x: np.sum(x) - 1},
         ]
 
     # Bounds
@@ -665,18 +728,14 @@ def optimize_portfolio(
 
     # Objective functions
     def neg_sharpe_ratio(weights):
-        portfolio_return = np.sum(mean_returns * weights) * 12
-        portfolio_volatility = np.sqrt(
-            np.dot(weights.T, np.dot(cov_matrix * 12, weights))
-        )
+        portfolio_return = np.sum(mean_returns * weights)
+        portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
         sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
         return -sharpe_ratio
 
     def negative_utility(weights):
-        portfolio_return = np.sum(mean_returns * weights) * 12
-        portfolio_volatility = np.sqrt(
-            np.dot(weights.T, np.dot(cov_matrix * 12, weights))
-        )
+        portfolio_return = np.sum(mean_returns * weights)
+        portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
         utility = portfolio_return - 0.5 * risk_aversion * (portfolio_volatility**2)
         return -utility
 
@@ -727,18 +786,612 @@ def optimize_portfolio(
     return result, mean_returns, cov_matrix
 
 
-# Run the functions
+# -------------------------------
+# 6. Efficient Frontier Calculation
+# -------------------------------
 
-if st.button("Run Optimization"):
-    tangency_result, tangency_mean_returns, tangency_cov_matrix = optimize_portfolio(
-        data,
+
+# 6. Efficient Frontier Calculation Using PyPortfolioOpt
+def calculate_efficient_frontier_pypfopt(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    # Set weight bounds
+    if long_only:
+        weight_bounds = (
+            max(min_weight_value, 0.0),
+            min(max_weight_value, leverage_limit_value),
+        )
+    else:
+        weight_bounds = (
+            -1,
+            1,
+        )
+
+    # Initialize Efficient Frontier
+    ef = EfficientFrontier(mean_returns, cov_matrix, weight_bounds=weight_bounds)
+
+    # Add leverage limit constraint
+    ef.add_constraint(lambda w: cp.sum(w) <= leverage_limit_value)
+    ef.add_constraint(lambda w: cp.sum(w) >= 1)
+
+    # Generate Efficient Frontier
+    target_returns = np.linspace(
+        -mean_returns.max(),
+        mean_returns.max(),
+        50,
+    )
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    for ret in stqdm(target_returns, desc="PyPortfolioOpt frontier computation..."):
+        ef_copy = ef.deepcopy()
+        ef_copy.efficient_return(target_return=ret)
+        weights = ef_copy.weights
+        frontier_weights.append(weights)
+        performance = ef_copy.portfolio_performance(risk_free_rate=risk_free_rate)
+        frontier_returns.append(performance[0])
+        frontier_volatility.append(performance[1])
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+def calculate_efficient_frontier_qp(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    num_assets = len(mean_returns)
+    cov_matrix = cov_matrix.values
+    mean_returns = mean_returns.values
+
+    # # Regularize the covariance matrix to make it positive semidefinite
+    # epsilon = 1e-7  # Small positive value
+    # cov_matrix_np += epsilon * np.eye(num_assets)
+    # cov_matrix = pd.DataFrame(
+    #     cov_matrix_np, index=cov_matrix.index, columns=cov_matrix.columns
+    # )
+
+    # Define variables
+    w = cp.Variable((num_assets, 1))
+    portfolio_return = mean_returns.T @ w
+    portfolio_variance = cp.quad_form(w, cov_matrix)
+
+    if leverage_limit:
+        # Leverage limit constraint
+        # Constraints
+        constraints = [cp.sum(w) >= 1]
+        constraints += [cp.sum(w) <= leverage_limit_value]
+    else:
+        constraints = [cp.sum(w) == 1]
+
+    # Weight bounds
+    if long_only:
+        constraints += [
+            w >= max(min_weight_value, 0.0),
+            w <= min(max_weight_value, leverage_limit_value),
+        ]
+    else:
+        constraints += [
+            w >= -1,
+            w <= 1,
+        ]
+
+    # Target returns for the efficient frontier
+    target_returns = np.linspace(
+        -mean_returns.max(),
+        mean_returns.max() * 3,
+        50,
+    )
+
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    for target_return in stqdm(target_returns, desc="QP Frontier computation..."):
+        # Objective: Minimize variance
+        objective = cp.Minimize(portfolio_variance)
+
+        # Constraints for target return
+        constraints_with_return = constraints + [portfolio_return == target_return]
+
+        # Problem
+        prob = cp.Problem(objective, constraints_with_return)
+
+        # Solve the problem
+        prob.solve(solver=cp.SCS)
+
+        if prob.status not in ["infeasible", "unbounded"]:
+            vol = np.sqrt(portfolio_variance.value)[0]  # Annualized volatility
+            frontier_volatility.append(vol)
+            frontier_returns.append(target_return)
+            frontier_weights.append(w.value.flatten())
+        else:
+            st.warning(
+                f"Optimization failed for target return {target_return:.2%}. Status: {prob.status}"
+            )
+            continue
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+# Efficient Frontier Calculation
+def calculate_efficient_frontier(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    if leverage_limit:
+        target_returns = np.linspace(
+            mean_returns.min(),
+            mean_returns.max() * leverage_limit_value * 12 * 2.5,
+            50,
+        )
+    else:
+        target_returns = np.linspace(
+            -mean_returns.max() * 12 * leverage_limit_value,
+            mean_returns.max() * 12 * leverage_limit_value,
+            50,
+        )
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    num_assets = len(mean_returns)
+
+    for idx, target_return in enumerate(
+        stqdm(target_returns, desc="Computing the frontier... ")
+    ):
+        # Constraints for the optimization
+        constraints = [
+            {"type": "eq", "fun": lambda x: np.sum(x) - 1},  # Sum of weights equals 1
+            {
+                "type": "eq",
+                "fun": lambda x: np.sum(x * mean_returns * 12)
+                - target_return,  # Target return constraint
+            },
+        ]
+
+        # Leverage limit constraint
+        if leverage_limit:
+            constraints = [
+                {
+                    "type": "ineq",
+                    "fun": lambda x: leverage_limit_value
+                    - np.sum(x),  # Sum of weights <= leverage limit
+                },
+                {"type": "ineq", "fun": lambda x: np.sum(x) - 1},  # Sum of weights >= 1
+                {
+                    "type": "eq",
+                    "fun": lambda x: np.sum(x * mean_returns * 12)
+                    - target_return,  # Target return constraint --> portfolio return = target return
+                },
+            ]
+
+        # Bounds
+        if long_only:
+            # Apply minimum and maximum weight constraints
+            bounds = tuple(
+                (max(min_weight_value, 0.0), min(max_weight_value, 1.0))
+                for _ in range(num_assets)
+            )
+        else:
+            # Allow short selling within a limit of 1 per asset
+            bounds = tuple((-1, 1) for _ in range(num_assets))
+
+        # Progress bar
+        progress_bar = st.progress(0)
+        iteration_container = st.empty()
+
+        max_iterations = (
+            10  # Set maximum number of iterations for estimation if taking too long
+        )
+
+        iteration_counter = {"n_iter": 0}
+
+        # Callback function to update progress
+        def callbackF(xk):
+            iteration_counter["n_iter"] += 1
+            progress = iteration_counter["n_iter"] / max_iterations
+            progress_bar.progress(min(progress, 1.0))
+            iteration_container.text(f"Iteration: {iteration_counter['n_iter']}")
+
+        # Optimization
+        with st.spinner("Optimization in progress..."):
+            start_time = time.time()
+            result = minimize(
+                lambda x: np.sqrt(
+                    np.dot(x.T, np.dot(cov_matrix * 12, x))
+                ),  # Minimize volatility
+                num_assets * [1.0 / num_assets],  # Initial guess
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"maxiter": max_iterations},
+                callback=callbackF,
+            )
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+
+        progress_bar.empty()
+        iteration_container.empty()
+
+        if result.success:
+            st.success(f"Optimization completed in {elapsed_time:.2f} seconds")
+            frontier_volatility.append(result.fun)
+            frontier_returns.append(target_return)
+            frontier_weights.append(result.x)
+        elif result.status == 9:
+            st.warning(
+                f"Optimization for target return {target_return:.2%} reached maximum iterations."
+            )
+            frontier_volatility.append(result.fun)
+            frontier_returns.append(target_return)
+            frontier_weights.append(result.x)
+        else:
+            # Handle optimization failure
+            st.warning(f"Optimization failed for target return {target_return:.2%}")
+            pass
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+# -------------------------------
+# 7. Sampling Methods Implementation
+# -------------------------------
+
+# --- Adjusted Dirichlet Sampling ---
+
+
+def generate_biased_random_portfolios(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    num_portfolios,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+    bias_method="expected_returns",
+    lambda_scale=100,
+):
+    num_assets = len(mean_returns)
+    results = np.zeros((3, num_portfolios))
+    weights_record = np.zeros((num_portfolios, num_assets))
+    accepted_portfolios = 0  # Index for accepted portfolios
+
+    # Compute alpha parameters for Dirichlet distribution
+    if bias_method == "expected_returns":
+        alpha = mean_returns.values.copy()
+        alpha = alpha - alpha.min() + 1e-6  # Shift to make all values positive
+        alpha = alpha / alpha.sum()
+    elif bias_method == "inverse_variance":
+        variances = np.diag(cov_matrix)
+        alpha = 1 / variances
+        alpha = alpha - alpha.min() + 1e-6
+        alpha = alpha / alpha.sum()
+    elif bias_method == "combined":
+        variances = np.diag(cov_matrix)
+        alpha = mean_returns.values / variances
+        alpha = alpha - alpha.min() + 1e-6
+        alpha = alpha / alpha.sum()
+    else:
+        raise ValueError(
+            "Invalid bias_method. Choose 'expected_returns', 'inverse_variance', or 'combined'."
+        )
+
+    # Scale alpha parameters
+    alpha = alpha * lambda_scale
+
+    count = 0
+
+    for i in stqdm(range(num_portfolios), desc="Dirichlet sampling..."):
+
+        # Generate weights using Dirichlet distribution with adjusted alpha
+        weights = np.random.dirichlet(alpha)
+        s = np.random.uniform(1, leverage_limit_value)
+        weights *= s  # Scale weights
+
+        # Apply weight bounds
+        weights = np.clip(weights, -1, 1)
+
+        # # Normalize weights to sum to 1
+        # weights /= np.sum(weights)
+
+        # Check leverage limit
+        if np.sum(weights) > leverage_limit_value or np.sum(weights) < 1:
+            count += 1
+            continue  # Skip this portfolio
+
+        # Apply long-only constraint if necessary
+        if long_only and np.any(weights < 0):
+            count += 1
+            continue  # Skip portfolios with negative weights
+
+        # Calculate portfolio performance
+        portfolio_return = np.sum(mean_returns * weights) * 12  # Annualized return
+        portfolio_volatility = np.sqrt(
+            np.dot(weights.T, np.dot(cov_matrix * 12, weights))
+        )  # Annualized volatility
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+
+        results[0, i] = portfolio_volatility
+        results[1, i] = portfolio_return
+        results[2, i] = sharpe_ratio
+        weights_record[i, :] = weights
+
+        accepted_portfolios += 1
+
+    st.write(f"Skipped portfolios from Dirichet: {count}")
+
+    # Truncate arrays to include only accepted portfolios
+    results = results[:, :accepted_portfolios]
+    weights_record = weights_record[:accepted_portfolios, :]
+
+    return results, weights_record
+
+
+# --- Latin Hypercube Sampling (LHS) ---
+
+
+def generate_lhs_random_portfolios(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    num_portfolios,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    num_assets = len(mean_returns)
+    results = np.zeros((3, num_portfolios))
+    weights_record = np.zeros((num_portfolios, num_assets))
+    accepted_portfolios = 0  # Index for accepted portfolios
+
+    # Create a Latin Hypercube Sampler
+    sampler = qmc.LatinHypercube(d=num_assets)
+    sample = sampler.random(n=num_portfolios)
+
+    # Scale samples to the desired weight bounds
+    if long_only:
+        lower_bounds = np.full(num_assets, max(min_weight_value, 0.0))
+        upper_bounds = np.full(num_assets, min(max_weight_value, leverage_limit_value))
+    else:
+        lower_bounds = np.full(num_assets, -1)
+        upper_bounds = np.full(num_assets, 1)
+
+    # Transform samples to the desired range
+    weights_array = qmc.scale(sample, lower_bounds, upper_bounds)
+
+    count = 0
+    for i in stqdm(range(num_portfolios), desc="LHS sampling..."):
+        weights = weights_array[i, :]
+
+        # # Normalize weights to sum to 1
+        # weights /= np.sum(weights)
+
+        # Check leverage limit
+        if np.sum(weights) > leverage_limit_value or np.sum(weights) < 1:
+            count += 1
+            continue  # Skip this portfolio
+
+        # Apply long-only constraint if necessary
+        if long_only and np.any(weights < 0):
+            continue  # Skip portfolios with negative weights
+
+        # Calculate portfolio performance
+        portfolio_return = np.sum(mean_returns * weights)  # Annualized return
+        portfolio_volatility = np.sqrt(
+            np.dot(weights.T, np.dot(cov_matrix, weights))
+        )  # Annualized volatility
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+
+        results[0, i] = portfolio_volatility
+        results[1, i] = portfolio_return
+        results[2, i] = sharpe_ratio
+        weights_record[accepted_portfolios, :] = weights
+
+        accepted_portfolios += 1  # Increment index
+
+    st.write(f"Skipped portfolios from LHS: {count}")
+
+    # Truncate arrays to include only accepted portfolios
+    results = results[:, :accepted_portfolios]
+    weights_record = weights_record[:accepted_portfolios, :]
+
+    return results, weights_record
+
+
+# -------------------------------
+# 8. Plotting Function Incorporating Both Sampling Methods
+# -------------------------------
+
+
+# Efficient Frontier Plotting Function
+def plot_efficient_frontier(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    weights_optimal,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+    tangency_weights,
+    num_portfolios=5000,
+):
+    # Calculate the efficient frontier with updated constraints
+    frontier_volatility, frontier_returns, frontier_weights = (
+        calculate_efficient_frontier_qp(
+            mean_returns,
+            cov_matrix,
+            risk_free_rate,
+            include_risk_free_asset,
+            long_only,
+            leverage_limit_value,
+            min_weight_value,
+            max_weight_value,
+        )
+    )
+
+    # Check tangency weights
+    if np.sum(tangency_weights) > leverage_limit_value or np.sum(tangency_weights) < 1:
+        st.write("Tangency portfolio doesn't meet the constraints ")
+    else:
+        st.write("Tangency portfolio fit the constraints")
+
+    if np.min(tangency_weights) < -1 or np.max(tangency_weights) > 1:
+        st.write("Tangency portfolio doesn't fit the individual asset leverage limit")
+    else:
+        st.write("Tangency portfolio fit the individual asset leverage limit")
+
+    # # Generate portfolios using Adjusted Dirichlet Sampling
+    # st.info("Generating portfolios using Adjusted Dirichlet Sampling...")
+    # results_dirichlet, _ = generate_biased_random_portfolios(
+    #     mean_returns,
+    #     cov_matrix,
+    #     risk_free_rate,
+    #     num_portfolios,
+    #     long_only,
+    #     leverage_limit_value,
+    #     min_weight_value,
+    #     max_weight_value,
+    #     bias_method="expected_returns",  # You can change to 'inverse_variance' or 'combined'
+    #     lambda_scale=10,  # Adjust as needed
+    # )
+
+    # Generate portfolios using Latin Hypercube Sampling
+    st.info("Generating portfolios using Latin Hypercube Sampling...")
+    results_lhs, _ = generate_lhs_random_portfolios(
+        mean_returns,
+        cov_matrix,
+        risk_free_rate,
+        num_portfolios,
         long_only,
+        leverage_limit_value,
         min_weight_value,
         max_weight_value,
-        leverage_limit_value,
-        risk_free_rate,
-        include_risk_free_asset,
-        risk_aversion,
+    )
+
+    # Plotting
+    plt.figure(figsize=(10, 7))
+
+    # # Plot Adjusted Dirichlet Sampling portfolios
+    # plt.scatter(
+    #     results_dirichlet[0],
+    #     results_dirichlet[1],
+    #     c=results_dirichlet[2],
+    #     cmap="viridis",
+    #     s=2,
+    #     alpha=0.4,
+    #     label="Adjusted Dirichlet Portfolios",
+    # )
+
+    # Plot Latin Hypercube Sampling portfolios
+    plt.scatter(
+        results_lhs[0],
+        results_lhs[1],
+        c=results_lhs[2],
+        cmap="plasma",
+        s=2,
+        alpha=0.4,
+        label="LHS Portfolios",
+    )
+
+    # plt.colorbar(label="Sharpe Ratio")
+    plt.plot(
+        frontier_volatility,
+        frontier_returns,
+        "r--",
+        linewidth=3,
+        label="Efficient Frontier",
+    )
+
+    if include_risk_free_asset:
+
+        # Plot the Capital Market Line and Tangency Portfolio
+        tangency_weights = weights_optimal
+        tangency_return = np.sum(mean_returns * tangency_weights)
+        tangency_volatility = np.sqrt(
+            np.dot(tangency_weights.T, np.dot(cov_matrix, tangency_weights))
+        )
+
+        # Plot the Capital Market Line
+        cml_x = [0, tangency_volatility]
+        cml_y = [risk_free_rate, tangency_return]
+        plt.plot(
+            cml_x, cml_y, color="green", linestyle="--", label="Capital Market Line"
+        )
+
+        # Highlight the tangency portfolio
+        plt.scatter(
+            tangency_volatility,
+            tangency_return,
+            marker="*",
+            color="red",
+            s=500,
+            label="Tangency Portfolio",
+        )
+        # else:
+        #     st.warning("Failed to compute the tangency portfolio.")
+    else:
+        # Highlight the optimal portfolio
+        portfolio_return = np.sum(mean_returns * weights_optimal)
+        portfolio_volatility = np.sqrt(
+            np.dot(weights_optimal.T, np.dot(cov_matrix, weights_optimal))
+        )
+        plt.scatter(
+            portfolio_volatility,
+            portfolio_return,
+            marker="*",
+            color="red",
+            s=500,
+            label="Optimal Portfolio",
+        )
+
+    plt.title("Efficient Frontier with Random Portfolios")
+    plt.xlabel("Annualized Volatility")
+    plt.ylabel("Annualized Expected Returns")
+    plt.legend()
+    st.pyplot(plt)
+
+
+# -------------------------------
+# 9. Main Application Logic
+# -------------------------------
+
+
+if st.button("Run Optimization"):
+    tangency_result, tangency_mean_returns, tangency_cov_matrix = (
+        optimize_portfolio_PyPortfolioOpt(
+            data,
+            long_only,
+            min_weight_value,
+            max_weight_value,
+            leverage_limit_value,
+            risk_free_rate,
+            include_risk_free_asset,
+            risk_aversion,
+        )
     )
     weights = pd.Series(tangency_result.x, index=assets)
     st.session_state["optimization_run"] = True
@@ -747,13 +1400,12 @@ if st.button("Run Optimization"):
     st.session_state["cov_matrix"] = tangency_cov_matrix
 
     # Display optimization results
-    st.subheader("Optimized Portfolio Weights:")
-    st.write(weights.apply(lambda x: f"{x:.2%}"))
+    # st.write(weights.apply(lambda x: f"{x:.2%}"))
 
     # Calculate portfolio performance
-    portfolio_return = np.sum(tangency_mean_returns * weights) * 12  # Annualized return
+    portfolio_return = np.sum(tangency_mean_returns * weights)  # Annualized return
     portfolio_volatility = np.sqrt(
-        np.dot(weights.T, np.dot(tangency_cov_matrix * 12, weights))
+        np.dot(weights.T, np.dot(tangency_cov_matrix, weights))
     )  # Annualized volatility
 
     if include_risk_free_asset:
@@ -764,15 +1416,31 @@ if st.button("Run Optimization"):
         allocation_tangency = (portfolio_return - risk_free_rate) / (
             risk_aversion * (portfolio_volatility**2)
         )
-        # allocation_tangency = min(max(allocation_tangency, 0), 1)
-        allocation_risk_free = max(1 - allocation_tangency, 0)
+        allocation_tangency = min(max(allocation_tangency, 0), sum(weights))
+        allocation_risk_free = max(sum(weights) - allocation_tangency, 0)
 
         st.subheader("Portfolio Performance with Risk-Free Asset:")
         st.write(f"Expected Annual Return: {portfolio_return:.2%}")
         st.write(f"Annual Volatility: {portfolio_volatility:.2%}")
+        st.write(f"Max tangency mean returns: {tangency_mean_returns.max()}")
+        st.write(f"Max tangency weights: {weights.max()}")
         st.write(f"Sharpe Ratio: {sharpe_ratio:.2f}")
         st.write(f"Invest {allocation_tangency * 100:.2f}% in the tangency portfolio.")
         st.write(f"Invest {allocation_risk_free * 100:.2f}% in the risk-free asset.")
+
+        # Show the allocation
+        allocation_df = pd.DataFrame({"ISIN": assets, "Weight": weights})
+        # Create a mapping of ISIN to Company name from static_data
+        isin_to_company = dict(zip(static_data["ISIN"], static_data["Company"]))
+
+        # Replace ISIN in allocation_df with the corresponding company names
+        allocation_df["ISIN"] = allocation_df["ISIN"].map(isin_to_company)
+
+        # Optionally rename the column to reflect the new data
+        allocation_df.rename(columns={"ISIN": "Company"})
+
+        st.subheader("Tangency Portfolio Weights:")
+        st.write(allocation_df)
 
     else:
         # Calculate Sharpe Ratio
@@ -785,6 +1453,15 @@ if st.button("Run Optimization"):
 
         # Show the allocation
         allocation_df = pd.DataFrame({"ISIN": assets, "Weight": weights})
+        # Create a mapping of ISIN to Company name from static_data
+        isin_to_company = dict(zip(static_data["ISIN"], static_data["Company"]))
+
+        # Replace ISIN in allocation_df with the corresponding company names
+        allocation_df["ISIN"] = allocation_df["ISIN"].map(isin_to_company)
+
+        # Optionally rename the column to reflect the new data
+        allocation_df.rename(columns={"ISIN": "Company"})
+
         st.write("Optimal Portfolio Allocation:")
         st.write(allocation_df)
     st.write(f"Sum of the weights: {np.sum(weights)}")
@@ -796,15 +1473,12 @@ if st.session_state["optimization_run"]:
     if st.button("Show Efficient Frontier"):
         # Retrieve necessary variables from session state
         weights = st.session_state["weights"]
+        mean_returns = st.session_state["mean_returns"]
+        cov_matrix = st.session_state["cov_matrix"]
 
-        returns = data.pct_change().dropna()
-        mean_returns = returns.mean()
-        cov_matrix = returns.cov()
+        st.write(f"Max mean returns for plot: {mean_returns.max()}")
         num_assets = len(mean_returns)
-        if "weights" in locals():
-            weights_optimal = weights.values
-        else:
-            weights_optimal = None
+        weights_optimal = weights.values
 
         plot_efficient_frontier(
             mean_returns,
@@ -816,6 +1490,8 @@ if st.session_state["optimization_run"]:
             leverage_limit_value,
             min_weight_value,
             max_weight_value,
+            weights_optimal,
+            num_portfolios=50000,
         )
     else:
         st.write('Click "Show Efficient Frontier" to display the graph.')
