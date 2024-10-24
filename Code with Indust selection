@@ -1,0 +1,24 @@
+# -------------------------------
+# 4. Filtrage des données en fonction des secteurs
+# -------------------------------
+
+# Afficher le nombre total d'actions avant le filtrage
+st.write(f"Total number of stocks before filtering: {data.shape[1]}")
+
+# Filtrer les actions en fonction des secteurs
+def filter_stocks(data, sectors=None):
+    all_isins = data.columns.tolist()
+
+    if sectors is not None:
+        companies_sector = static_data[static_data["GICSSectorName"].isin(sectors)]
+        sector_isins = companies_sector["ISIN"].tolist()
+        all_isins = list(set(all_isins).intersection(set(sector_isins)))
+        st.write(f"Total number of stocks after sector filtering: {len(all_isins)}")
+
+    data_filtered = data[all_isins]
+    return data_filtered
+
+# Appliquer le filtrage basé sur les secteurs
+data = filter_stocks(data, sectors=selected_sectors)
+assets = data.columns.tolist()
+
