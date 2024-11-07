@@ -10,7 +10,7 @@ Version 0.1 :
         - Max sharpe ratio optimization : IMPLEMENTED
         - Min variance optimization : NOT IMPLEMENTED
 - Efficient frontier graph : IMPLEMENTED
-- Backtesting on out-of-sample data : NOT IMPLEMENTED
+- Backtesting on out-of-sample data : Implemented (Using past data with weight calculate)
 - Risk-Aversion Quiz : IMPLEMENTED BUT ADAPT QUESTIONS
 - Use risk-free or not possibility : IMPLEMENTED
 - Constraints : 
